@@ -93,6 +93,10 @@ final class OrientationManager {
     return sensorOrientation.relativeTo(orientation: deviceOrientation)
   }
 
+  var _deviceOrientation: Orientation {
+    return sensorOrientation.relativeTo(orientation: deviceOrientation)
+  }
+
   init() {
     // Default values for Orientation
     sensorOrientation = DEFAULT_SENSOR_ORIENTATION

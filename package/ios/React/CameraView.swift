@@ -9,6 +9,8 @@
 import AVFoundation
 import Foundation
 import UIKit
+import MetalPetal
+import MetalKit
 
 // TODOs for the CameraView which are currently too hard to implement either because of AVFoundation's limitations, or my brain capacity
 //
@@ -20,8 +22,10 @@ import UIKit
 
 // MARK: - CameraView
 
-public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegate, FpsSampleCollectorDelegate {
+public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegate, FpsSampleCollectorDelegate,MTKViewDelegate {
   // pragma MARK: React Properties
+
+  private var lutFilter: MTIColorLookupFilter?
 
   // props that require reconfiguring
   @objc var cameraId: NSString?
@@ -40,7 +44,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
   @objc var enableLocation = false
   @objc var preview = true {
     didSet {
-      updatePreview()
+      // updatePreview()
     }
   }
 
@@ -64,7 +68,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
   @objc var videoStabilizationMode: NSString?
   @objc var resizeMode: NSString = "cover" {
     didSet {
-      updatePreview()
+      // updatePreview()
     }
   }
 
@@ -82,6 +86,31 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
   @objc var onAverageFpsChangedEvent: RCTDirectEventBlock?
   @objc var onCodeScannedEvent: RCTDirectEventBlock?
 
+  @objc var lutAsset: NSDictionary? {
+    didSet {
+      guard let lutUIImage = RCTConvert.uiImage(lutAsset) else {
+        print("❌ Failed to convert LUT asset")
+        return
+      }
+      
+      guard let cgImage = lutUIImage.cgImage else {
+        return
+      }
+      
+      // Create MTIImage for LUT
+      let lutMTIImage = MTIImage(cgImage: cgImage, options: [.SRGB: true], isOpaque: false)
+      
+      // Create filter if not created yet
+      if lutFilter == nil {
+        lutFilter = MTIColorLookupFilter()
+      }
+      
+      lutFilter?.inputColorLookupTable = lutMTIImage
+      lutFilter?.intensity = 0.8
+      print("✅ LUT updated")
+    }
+  }
+
   // zoom
   @objc var enableZoomGesture = false {
     didSet {
@@ -98,9 +127,14 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
   #endif
 
   // pragma MARK: Internal Properties
+  var orientationManager = OrientationManager()
   var cameraSession = CameraSession()
   var previewView: PreviewView?
   var isMounted = false
+  var _mtkView: MTKView?
+  private var renderContext: MTIContext?
+  private var latestImage: MTIImage?
+  private let imageLock = NSLock()
   private var currentConfigureCall: DispatchTime?
   private let fpsSampleCollector = FpsSampleCollector()
 
@@ -117,14 +151,32 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
     super.init(frame: frame)
     cameraSession.delegate = self
     fpsSampleCollector.delegate = self
-    updatePreview()
+    setupMetalRendering()
+    // updatePreview()
   }
 
   @available(*, unavailable)
   required init?(coder _: NSCoder) {
     fatalError("init(coder:) is not implemented.")
   }
-
+  // MARK: - Metal Rendering Setup
+  private func setupMetalRendering() {
+    // 1️⃣ Metal device and MetalPetal context
+    guard let device = MTLCreateSystemDefaultDevice() else { return }
+    renderContext = try? MTIContext(device: device)
+    
+    // 2️⃣ MTKView
+    let view = MTKView(frame: bounds, device: device)
+    //    view.framebufferOnly = false
+    //    view.enableSetNeedsDisplay = false
+    //    view.isPaused = false
+    view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    // Match pixel format to BGRA as we capture 32BGRA
+    view.colorPixelFormat = .bgra8Unorm
+    view.delegate = self
+    addSubview(view)
+    self._mtkView = view
+  }
   override public func willMove(toSuperview newSuperview: UIView?) {
     super.willMove(toSuperview: newSuperview)
 
@@ -214,6 +266,10 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
                                                                   enableFrameProcessor: enableFrameProcessor))
       } else {
         config.video = .disabled
+      }
+
+      if(lutFilter != nil){
+        config.lutFilter = lutFilter
       }
 
       // Audio
@@ -366,6 +422,59 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
     // Update latest frame that can be used for snapshot capture
     latestVideoFrame = Snapshot(imageBuffer: sampleBuffer, orientation: orientation)
 
+    // Get camera pixel buffer
+    guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+    let inputImage = MTIImage(cvPixelBuffer: pixelBuffer, alphaType: .alphaIsOne)
+    
+    // Apply LUT if available
+    let filteredImage: MTIImage
+    if let lutFilter = lutFilter {
+      lutFilter.inputImage = inputImage
+      filteredImage = lutFilter.outputImage ?? inputImage
+    } else {
+      filteredImage = inputImage
+    }
+    
+    // Determine rotation angle (your original mapping)
+    var rotateAngle: CGFloat = 0.0
+    switch cameraSession.orientationManager._deviceOrientation {
+    case .portrait: rotateAngle = -.pi / 2
+    case .landscapeLeft: rotateAngle = -.pi / 2
+    case .portraitUpsideDown: rotateAngle = -.pi / 2
+    case .landscapeRight: rotateAngle = 3 * .pi / 2
+    @unknown default: rotateAngle = 0
+    }
+    
+    // Get original image size
+    let imageWidth = filteredImage.size.width
+    let imageHeight = filteredImage.size.height
+    
+    // Compute rotated bounding box size
+    let rotatedWidth = abs(imageWidth * cos(rotateAngle)) + abs(imageHeight * sin(rotateAngle))
+    let rotatedHeight = abs(imageWidth * sin(rotateAngle)) + abs(imageHeight * cos(rotateAngle))
+    
+    // Compute scale to fit rotated image inside original bounds
+    let scaleX = imageWidth / rotatedWidth
+    let scaleY = imageHeight / rotatedHeight
+    let scale = min(scaleX, scaleY)
+    
+    // Apply rotation and scale
+    let transformFilter = MTITransformFilter()
+    let rotationTransform = CATransform3DMakeRotation(rotateAngle, 0, 0, 1)
+    transformFilter.transform = CATransform3DScale(rotationTransform, scale, scale, 1)
+    transformFilter.inputImage = filteredImage
+    
+    // Store latest image
+    imageLock.lock()
+    latestImage = transformFilter.outputImage
+    imageLock.unlock()
+    
+    // Trigger MTKView draw on main thread
+    DispatchQueue.main.async { [weak self] in
+      self?._mtkView?.draw()
+    }
+    
+
     // Notify FPS Collector that we just had a Frame
     fpsSampleCollector.onTick()
 
@@ -391,5 +500,29 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
     onAverageFpsChangedEvent?([
       "averageFps": averageFps,
     ])
+  }
+
+  // MARK: - MTKViewDelegate
+  public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+    // No-op for now. Could be used to update scaling if needed.
+  }
+  
+  public func draw(in view: MTKView) {
+    guard let renderContext = renderContext else { return }
+    imageLock.lock()
+    let image = latestImage
+    imageLock.unlock()
+    guard let imageToRender = image else { return }
+    //    guard let drawable = view.currentDrawable else { return }
+    
+    // Build a drawable rendering request; use aspectFill to match contentMode
+    let request = MTIDrawableRenderingRequest(drawableProvider: view, resizingMode: .aspectFill)
+    
+    do {
+      try renderContext.render(imageToRender, toDrawableWithRequest: request)
+    } catch {
+      // Swallow or log as needed
+      // print("Render error: \(error)")
+    }
   }
 }

@@ -8,6 +8,7 @@
 
 import AVFoundation
 import Foundation
+import MetalPetal
 
 // MARK: - CameraConfiguration
 
@@ -25,6 +26,8 @@ final class CameraConfiguration {
 
   // Location
   var enableLocation = false
+
+  var lutFilter: MTIColorLookupFilter?
 
   // Video Stabilization
   var videoStabilizationMode: VideoStabilizationMode = .off
