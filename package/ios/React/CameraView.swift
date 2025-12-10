@@ -34,15 +34,25 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
   @objc var isMirrored = false
   @objc var lutAsset: NSDictionary? {
     didSet{
+      // If lutAsset is nil, clear the LUT texture
+      guard let lutAsset = lutAsset else {
+        lutTexture = nil
+        updatePreview()
+        return
+      }
       
       guard let lutUIImage = RCTConvert.uiImage(lutAsset) else {
         print("❌ Failed to convert LUT asset")
+        lutTexture = nil
+        updatePreview()
         return
       }
       
       guard let cgImage = lutUIImage.cgImage else {
-          return
-        }
+        lutTexture = nil
+        updatePreview()
+        return
+      }
       
       let textureLoader = MTKTextureLoader(device: MTLCreateSystemDefaultDevice()!)
       
@@ -129,7 +139,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
   // pragma MARK: Internal Properties
   var cameraSession = CameraSession()
   var previewView: PreviewView?
-  var previewMetalView: PreviewMetalView!
+  var previewMetalView: PreviewMetalView?
   var videoFilter: FilterRenderer?
   var isMounted = false
   private var currentConfigureCall: DispatchTime?
@@ -320,24 +330,56 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
   
   func updatePreview() {
     if preview && previewView == nil {
+      // Always create PreviewView for normal camera preview
+      previewView = cameraSession.createPreviewView(frame: frame)
+      previewView!.delegate = self
+      addSubview(previewView!)
       
-      if(lutTexture != nil){
-        // Create PreviewView and add it
-        previewView = cameraSession.createPreviewView(frame: frame)
-        previewView!.delegate = self
-        addSubview(previewView!)
-        videoFilter = LutMetalRenderer(lutTexture: lutTexture!)
+      // Only add LUT filter and Metal view if LUT texture is available
+      if let lutTexture = lutTexture {
+        videoFilter = LutMetalRenderer(lutTexture: lutTexture)
         previewMetalView = PreviewMetalView(frame: frame)
-        addSubview(previewMetalView)
-        bringSubviewToFront(previewMetalView)
+        addSubview(previewMetalView!)
+        bringSubviewToFront(previewMetalView!)
+        // Hide the normal preview when using LUT
+        previewView!.isHidden = true
+      } else {
+        // No LUT, use normal preview
+        videoFilter?.reset()
+        videoFilter = nil
+        previewMetalView?.removeFromSuperview()
+        previewMetalView = nil
+        previewView!.isHidden = false
       }
-      
     } else if !preview && previewView != nil {
       // Remove PreviewView and destroy it
       previewView?.removeFromSuperview()
       previewView = nil
       previewMetalView?.removeFromSuperview()
       previewMetalView = nil
+      videoFilter?.reset()
+      videoFilter = nil
+    } else if preview && previewView != nil {
+      // Preview already exists, update LUT setup if needed
+      if let lutTexture = lutTexture {
+        // LUT is available, recreate filter with new texture (in case texture changed)
+        videoFilter?.reset()
+        videoFilter = LutMetalRenderer(lutTexture: lutTexture)
+        if previewMetalView == nil {
+          previewMetalView = PreviewMetalView(frame: frame)
+          addSubview(previewMetalView!)
+          bringSubviewToFront(previewMetalView!)
+        }
+        // Hide the normal preview when using LUT
+        previewView!.isHidden = true
+      } else {
+        // No LUT, remove filter and Metal view, show normal preview
+        videoFilter?.reset()
+        videoFilter = nil
+        previewMetalView?.removeFromSuperview()
+        previewMetalView = nil
+        previewView!.isHidden = false
+      }
     }
     
     if let previewView {
@@ -415,45 +457,48 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
     // Notify FPS Collector that we just had a Frame
     fpsSampleCollector.onTick()
     
-    DispatchQueue.main.async {
-      let interfaceOrientation = UIApplication.shared.connectedScenes.compactMap {$0 as? UIWindowScene}.first?.interfaceOrientation
-      if let unwrappedVideoDataOutputConnection = self.cameraSession.videoOutput!.connection(with: .video) {
-        let videoDevicePosition = self.cameraSession.videoDeviceInput!.device.position
-        let rotation = PreviewMetalView.Rotation(with: interfaceOrientation!,
-                                                 videoOrientation: unwrappedVideoDataOutputConnection.videoOrientation,
-                                                 cameraPosition: videoDevicePosition)
-        self.previewMetalView.mirroring = (videoDevicePosition == .front)
-        if let rotation = rotation {
-          self.previewMetalView.rotation = rotation
+    // Only update Metal view if it exists (i.e., when using LUT)
+    if let previewMetalView = previewMetalView {
+      DispatchQueue.main.async {
+        let interfaceOrientation = UIApplication.shared.connectedScenes.compactMap {$0 as? UIWindowScene}.first?.interfaceOrientation
+        if let unwrappedVideoDataOutputConnection = self.cameraSession.videoOutput!.connection(with: .video) {
+          let videoDevicePosition = self.cameraSession.videoDeviceInput!.device.position
+          let rotation = PreviewMetalView.Rotation(with: interfaceOrientation!,
+                                                   videoOrientation: unwrappedVideoDataOutputConnection.videoOrientation,
+                                                   cameraPosition: videoDevicePosition)
+          previewMetalView.mirroring = (videoDevicePosition == .front)
+          if let rotation = rotation {
+            previewMetalView.rotation = rotation
+          }
         }
       }
-    }
-    
-    guard let videoPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
-          let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
-      return
-    }
-    
-    var finalVideoPixelBuffer = videoPixelBuffer
-    if let filter = videoFilter {
-      if !filter.isPrepared {
-        /*
-         outputRetainedBufferCountHint is the number of pixel buffers the renderer retains. This value informs the renderer
-         how to size its buffer pool and how many pixel buffers to preallocate. Allow 3 frames of latency to cover the dispatch_async call.
-         */
-        filter.prepare(with: formatDescription, outputRetainedBufferCountHint: 3)
-      }
       
-      // Send the pixel buffer through the filter
-      guard let filteredBuffer = filter.render(pixelBuffer: finalVideoPixelBuffer) else {
-        print("Unable to filter video buffer")
+      guard let videoPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
+            let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
         return
       }
       
-      finalVideoPixelBuffer = filteredBuffer
+      var finalVideoPixelBuffer = videoPixelBuffer
+      if let filter = videoFilter {
+        if !filter.isPrepared {
+          /*
+           outputRetainedBufferCountHint is the number of pixel buffers the renderer retains. This value informs the renderer
+           how to size its buffer pool and how many pixel buffers to preallocate. Allow 3 frames of latency to cover the dispatch_async call.
+           */
+          filter.prepare(with: formatDescription, outputRetainedBufferCountHint: 3)
+        }
+        
+        // Send the pixel buffer through the filter
+        guard let filteredBuffer = filter.render(pixelBuffer: finalVideoPixelBuffer) else {
+          print("Unable to filter video buffer")
+          return
+        }
+        
+        finalVideoPixelBuffer = filteredBuffer
+      }
+      
+      previewMetalView.pixelBuffer = finalVideoPixelBuffer
     }
-    
-    previewMetalView.pixelBuffer = finalVideoPixelBuffer
     
     
 #if VISION_CAMERA_ENABLE_FRAME_PROCESSORS
