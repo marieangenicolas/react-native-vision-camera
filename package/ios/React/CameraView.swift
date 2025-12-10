@@ -9,6 +9,7 @@
 import AVFoundation
 import Foundation
 import UIKit
+import MetalKit
 
 // TODOs for the CameraView which are currently too hard to implement either because of AVFoundation's limitations, or my brain capacity
 //
@@ -22,14 +23,42 @@ import UIKit
 
 public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegate, FpsSampleCollectorDelegate {
   // pragma MARK: React Properties
-
+  
+  var lutTexture: MTLTexture?
+  
   // props that require reconfiguring
   @objc var cameraId: NSString?
   @objc var enableDepthData = false
   @objc var enablePortraitEffectsMatteDelivery = false
   @objc var enableBufferCompression = false
   @objc var isMirrored = false
-
+  @objc var lutAsset: NSDictionary? {
+    didSet{
+      
+      guard let lutUIImage = RCTConvert.uiImage(lutAsset) else {
+        print("❌ Failed to convert LUT asset")
+        return
+      }
+      
+      guard let cgImage = lutUIImage.cgImage else {
+          return
+        }
+      
+      let textureLoader = MTKTextureLoader(device: MTLCreateSystemDefaultDevice()!)
+      
+      lutTexture = try? textureLoader.newTexture(cgImage: cgImage, options: [
+          MTKTextureLoader.Option.SRGB : false
+      ])
+      if lutTexture == nil {
+          print("Failed to create LUT texture")
+      } else {
+          print("LUT Loaded")
+      }
+      
+      updatePreview()
+    }
+  }
+  
   // use cases
   @objc var photo = false
   @objc var video = false
@@ -43,7 +72,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
       updatePreview()
     }
   }
-
+  
   // props that require format reconfiguring
   @objc var format: NSDictionary?
   @objc var minFps: NSNumber?
@@ -55,7 +84,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
   @objc var outputOrientation: NSString?
   @objc var videoBitRateOverride: NSNumber?
   @objc var videoBitRateMultiplier: NSNumber?
-
+  
   // other props
   @objc var isActive = false
   @objc var torch = "off"
@@ -67,7 +96,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
       updatePreview()
     }
   }
-
+  
   // events
   @objc var onInitializedEvent: RCTDirectEventBlock?
   @objc var onErrorEvent: RCTDirectEventBlock?
@@ -81,7 +110,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
   @objc var onViewReadyEvent: RCTDirectEventBlock?
   @objc var onAverageFpsChangedEvent: RCTDirectEventBlock?
   @objc var onCodeScannedEvent: RCTDirectEventBlock?
-
+  
   // zoom
   @objc var enableZoomGesture = false {
     didSet {
@@ -92,42 +121,44 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
       }
     }
   }
-
-  #if VISION_CAMERA_ENABLE_FRAME_PROCESSORS
-    @objc public var frameProcessor: FrameProcessor?
-  #endif
-
+  
+#if VISION_CAMERA_ENABLE_FRAME_PROCESSORS
+  @objc public var frameProcessor: FrameProcessor?
+#endif
+  
   // pragma MARK: Internal Properties
   var cameraSession = CameraSession()
   var previewView: PreviewView?
+  var previewMetalView: PreviewMetalView!
+  var videoFilter: FilterRenderer?
   var isMounted = false
   private var currentConfigureCall: DispatchTime?
   private let fpsSampleCollector = FpsSampleCollector()
-
+  
   // CameraView+Zoom
   var pinchGestureRecognizer: UIPinchGestureRecognizer?
   var pinchScaleOffset: CGFloat = 1.0
-
+  
   // CameraView+TakeSnapshot
   var latestVideoFrame: Snapshot?
-
+  
   // pragma MARK: Setup
-
+  
   override public init(frame: CGRect) {
     super.init(frame: frame)
     cameraSession.delegate = self
     fpsSampleCollector.delegate = self
     updatePreview()
   }
-
+  
   @available(*, unavailable)
   required init?(coder _: NSCoder) {
     fatalError("init(coder:) is not implemented.")
   }
-
+  
   override public func willMove(toSuperview newSuperview: UIView?) {
     super.willMove(toSuperview: newSuperview)
-
+    
     if newSuperview != nil {
       fpsSampleCollector.start()
       if !isMounted {
@@ -138,14 +169,18 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
       fpsSampleCollector.stop()
     }
   }
-
+  
   override public func layoutSubviews() {
     if let previewView {
       previewView.frame = frame
       previewView.bounds = bounds
     }
+    if let previewMetalView {
+      previewMetalView.frame = frame
+      previewMetalView.bounds = bounds
+    }
   }
-
+  
   func getPixelFormat() -> PixelFormat {
     // TODO: Use ObjC RCT enum parser for this
     if let pixelFormat = pixelFormat as? String {
@@ -161,7 +196,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
     }
     return .yuv
   }
-
+  
   func getTorch() -> Torch {
     // TODO: Use ObjC RCT enum parser for this
     if let torch = try? Torch(jsValue: torch) {
@@ -169,7 +204,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
     }
     return .off
   }
-
+  
   func getPhotoQualityBalance() -> QualityBalance {
     if let photoQualityBalance = photoQualityBalance as? String,
        let balance = try? QualityBalance(jsValue: photoQualityBalance) {
@@ -177,13 +212,13 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
     }
     return .balanced
   }
-
+  
   // pragma MARK: Props updating
   override public final func didSetProps(_ changedProps: [String]!) {
     VisionLogger.log(level: .info, message: "Updating \(changedProps.count) props: [\(changedProps.joined(separator: ", "))]")
     let now = DispatchTime.now()
     currentConfigureCall = now
-
+    
     cameraSession.configure { [self] config in
       // Check if we're still the latest call to configure { ... }
       guard currentConfigureCall == now else {
@@ -192,11 +227,11 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
         VisionLogger.log(level: .info, message: "A new configure { ... } call arrived, aborting this one...")
         throw CameraConfiguration.AbortThrow.abort
       }
-
+      
       // Input Camera Device
       config.cameraId = cameraId as? String
       config.isMirrored = isMirrored
-
+      
       // Photo
       if photo {
         config.photo = .enabled(config: CameraConfiguration.Photo(qualityBalance: getPhotoQualityBalance(),
@@ -205,7 +240,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
       } else {
         config.photo = .disabled
       }
-
+      
       // Video/Frame Processor
       if video || enableFrameProcessor {
         config.video = .enabled(config: CameraConfiguration.Video(pixelFormat: getPixelFormat(),
@@ -215,14 +250,14 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
       } else {
         config.video = .disabled
       }
-
+      
       // Audio
       if audio {
         config.audio = .enabled(config: CameraConfiguration.Audio())
       } else {
         config.audio = .disabled
       }
-
+      
       // Code Scanner
       if let codeScannerOptions {
         let options = try CodeScannerOptions(fromJsValue: codeScannerOptions)
@@ -230,10 +265,10 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
       } else {
         config.codeScanner = .disabled
       }
-
+      
       // Location tagging
       config.enableLocation = enableLocation && isActive
-
+      
       // Video Stabilization
       if let jsVideoStabilizationMode = videoStabilizationMode as? String {
         let videoStabilizationMode = try VideoStabilizationMode(jsValue: jsVideoStabilizationMode)
@@ -241,7 +276,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
       } else {
         config.videoStabilizationMode = .off
       }
-
+      
       // Orientation
       if let jsOrientation = outputOrientation as? String {
         let outputOrientation = try OutputOrientation(jsValue: jsOrientation)
@@ -249,7 +284,7 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
       } else {
         config.outputOrientation = .device
       }
-
+      
       // Format
       if let jsFormat = format {
         let format = try CameraDeviceFormat(jsValue: jsFormat)
@@ -257,56 +292,67 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
       } else {
         config.format = nil
       }
-
+      
       // Side-Props
       config.minFps = minFps?.int32Value
       config.maxFps = maxFps?.int32Value
       config.enableLowLightBoost = lowLightBoost
       config.torch = try Torch(jsValue: torch)
-
+      
       // Zoom
       config.zoom = zoom.doubleValue
-
+      
       // Exposure
       config.exposure = exposure.floatValue
-
+      
       // isActive
       config.isActive = isActive
     }
-
+    
     // Store `zoom` offset for native pinch-gesture
     if changedProps.contains("zoom") {
       pinchScaleOffset = zoom.doubleValue
     }
-
+    
     // Prevent phone from going to sleep
     UIApplication.shared.isIdleTimerDisabled = isActive
   }
-
+  
   func updatePreview() {
     if preview && previewView == nil {
-      // Create PreviewView and add it
-      previewView = cameraSession.createPreviewView(frame: frame)
-      previewView!.delegate = self
-      addSubview(previewView!)
+      
+      if(lutTexture != nil){
+        // Create PreviewView and add it
+        previewView = cameraSession.createPreviewView(frame: frame)
+        previewView!.delegate = self
+        addSubview(previewView!)
+        videoFilter = LutMetalRenderer(lutTexture: lutTexture!)
+        previewMetalView = PreviewMetalView(frame: frame)
+        addSubview(previewMetalView)
+        bringSubviewToFront(previewMetalView)
+      }
+      
     } else if !preview && previewView != nil {
       // Remove PreviewView and destroy it
       previewView?.removeFromSuperview()
       previewView = nil
+      previewMetalView?.removeFromSuperview()
+      previewMetalView = nil
     }
-
+    
     if let previewView {
       // Update resizeMode from React
       let parsed = try? ResizeMode(jsValue: resizeMode as String)
       previewView.resizeMode = parsed ?? .cover
     }
   }
-
+  
+  
   // pragma MARK: Event Invokers
-
+  
   func onError(_ error: CameraError) {
     VisionLogger.log(level: .error, message: "Invoking onError(): \(error.message)")
-
+    
     var causeDictionary: [String: Any]?
     if case let .unknown(_, cause) = error,
        let cause = cause {
@@ -323,70 +369,111 @@ public final class CameraView: UIView, CameraSessionDelegate, PreviewViewDelegat
       "cause": causeDictionary ?? NSNull(),
     ])
   }
-
+  
   func onSessionInitialized() {
     onInitializedEvent?([:])
   }
-
+  
   func onCameraStarted() {
     onStartedEvent?([:])
   }
-
+  
   func onCameraStopped() {
     onStoppedEvent?([:])
   }
-
+  
   func onPreviewStarted() {
     onPreviewStartedEvent?([:])
   }
-
+  
   func onPreviewStopped() {
     onPreviewStoppedEvent?([:])
   }
-
+  
   func onCaptureShutter(shutterType: ShutterType) {
     onShutterEvent?([
       "type": shutterType.jsValue,
     ])
   }
-
+  
   func onOutputOrientationChanged(_ outputOrientation: Orientation) {
     onOutputOrientationChangedEvent?([
       "outputOrientation": outputOrientation.jsValue,
     ])
   }
-
+  
   func onPreviewOrientationChanged(_ previewOrientation: Orientation) {
     onPreviewOrientationChangedEvent?([
       "previewOrientation": previewOrientation.jsValue,
     ])
   }
-
+  
   func onFrame(sampleBuffer: CMSampleBuffer, orientation: Orientation, isMirrored: Bool) {
     // Update latest frame that can be used for snapshot capture
     latestVideoFrame = Snapshot(imageBuffer: sampleBuffer, orientation: orientation)
-
+    
     // Notify FPS Collector that we just had a Frame
     fpsSampleCollector.onTick()
-
-    #if VISION_CAMERA_ENABLE_FRAME_PROCESSORS
-      if let frameProcessor = frameProcessor {
-        // Call Frame Processor
-        let frame = Frame(buffer: sampleBuffer,
-                          orientation: orientation.imageOrientation,
-                          isMirrored: isMirrored)
-        frameProcessor.call(frame)
+    
+    DispatchQueue.main.async {
+      let interfaceOrientation = UIApplication.shared.connectedScenes.compactMap {$0 as? UIWindowScene}.first?.interfaceOrientation
+      if let unwrappedVideoDataOutputConnection = self.cameraSession.videoOutput!.connection(with: .video) {
+        let videoDevicePosition = self.cameraSession.videoDeviceInput!.device.position
+        let rotation = PreviewMetalView.Rotation(with: interfaceOrientation!,
+                                                 videoOrientation: unwrappedVideoDataOutputConnection.videoOrientation,
+                                                 cameraPosition: videoDevicePosition)
+        self.previewMetalView.mirroring = (videoDevicePosition == .front)
+        if let rotation = rotation {
+          self.previewMetalView.rotation = rotation
+        }
       }
-    #endif
+    }
+    
+    guard let videoPixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
+          let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
+      return
+    }
+    
+    var finalVideoPixelBuffer = videoPixelBuffer
+    if let filter = videoFilter {
+      if !filter.isPrepared {
+        /*
+         outputRetainedBufferCountHint is the number of pixel buffers the renderer retains. This value informs the renderer
+         how to size its buffer pool and how many pixel buffers to preallocate. Allow 3 frames of latency to cover the dispatch_async call.
+         */
+        filter.prepare(with: formatDescription, outputRetainedBufferCountHint: 3)
+      }
+      
+      // Send the pixel buffer through the filter
+      guard let filteredBuffer = filter.render(pixelBuffer: finalVideoPixelBuffer) else {
+        print("Unable to filter video buffer")
+        return
+      }
+      
+      finalVideoPixelBuffer = filteredBuffer
+    }
+    
+    previewMetalView.pixelBuffer = finalVideoPixelBuffer
+    
+    
+#if VISION_CAMERA_ENABLE_FRAME_PROCESSORS
+    if let frameProcessor = frameProcessor {
+      // Call Frame Processor
+      let frame = Frame(buffer: sampleBuffer,
+                        orientation: orientation.imageOrientation,
+                        isMirrored: isMirrored)
+      frameProcessor.call(frame)
+    }
+#endif
   }
-
+  
   func onCodeScanned(codes: [CameraSession.Code], scannerFrame: CameraSession.CodeScannerFrame) {
     onCodeScannedEvent?([
       "codes": codes.map { $0.toJSValue() },
       "frame": scannerFrame.toJSValue(),
     ])
   }
-
+  
   func onAverageFpsChanged(averageFps: Double) {
     onAverageFpsChangedEvent?([
       "averageFps": averageFps,
