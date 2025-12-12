@@ -1,6 +1,6 @@
 {
-  "name": "@marieangenicolas/react-native-vision-camera",
-  "version": "1.0.0",
+  "name": "@marieangenicolas/react-native-vision-camera-filtered-preview",
+  "version": "1.2.0",
   "description": "Custom fork of react-native-vision-camera with filtered preview.",
   "main": "lib/commonjs/index",
   "module": "lib/module/index",

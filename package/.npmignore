@@ -1,0 +1,49 @@
+# In package/ directory
+cat > .npmignore << 'EOF'
+# Development files
+__tests__
+__mocks__
+__fixtures__
+*.test.ts
+*.test.tsx
+*.spec.ts
+*.spec.tsx
+
+# Build files
+*.tsbuildinfo
+.expo/
+example/
+docs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# CI
+.github/
+.travis.yml
+.circleci/
+
+# Build artifacts
+android/build/
+ios/build/
+node_modules/
+
+# Config files
+tsconfig.json
+babel.config.js
+jest.config.js
+.eslintrc.js
+.prettierrc.js
+EOF
